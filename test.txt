@@ -1,0 +1,1650 @@
+--[[
+    NetNull v1.7.0
+    Trace-based readable reconstruction of Uh.txt.
+
+    IMPORTANT
+    =========
+    * Uh_VM_DECODED_RESOLVED.lua is the behavior-preserving VM build. Its encrypted
+      string table and 3,569 static string lookups were resolved, but the VM dispatcher remains.
+    * This file is the human-editable reconstruction. UI, settings, remotes and observable
+      callback behavior were rebuilt from sandbox traces.
+    * [TRACE-EXACT] means directly observed in both branches or a scenario run.
+    * [TRACE-INFERRED] means structure was reconstructed from observable calls, but the
+      original local names/control flow cannot be proven byte-for-byte.
+    * [TRACE-GAP] marks logic that could not be uniquely recovered without the live game state.
+
+    No HTTP request, file write or RemoteEvent was allowed to leave the emulator while tracing.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local WindUI
+local Window
+local Tabs = {}
+local Sections = {}
+local Controls = {}
+local Widgets = {}
+local Callbacks = {}
+
+local WIND_UI_SOURCE = "https://raw.githubusercontent.com/Neosq/WindUI-Boreal/main/WindUI%20Boreal"
+local CONFIG_ROOT = "PolyHub"
+local CONFIG_DIR = CONFIG_ROOT .. "/configs"
+local AUTOLOAD_FILE = CONFIG_ROOT .. "/autoload.txt"
+local THEME_FILE = CONFIG_ROOT .. "/theme.json"
+
+local State = {
+    autoFarmMode = "Tween",
+    autoFarmEnabled = false,
+    farmMovementSpeed = 100,
+    autoCollectEnabled = false,
+    faceNearestEnabled = false,
+    flushAuraEnabled = false,
+    hitboxEnabled = false,
+    hitboxMultiplier = 5,
+    selectedAbilities = {"All"},
+    autoKeybindsEnabled = false,
+    syncAbilitiesEnabled = false,
+    autoFillHpEnabled = false,
+    skipHelicopterEnabled = false,
+    autoBuyTitanEnabled = false,
+    autoBuySkillTreeEnabled = false,
+    autoUseRequestEnabled = false,
+    godModeEnabled = false,
+    godModeThreshold = 30,
+    walkSpeedEnabled = false,
+    walkSpeedValue = 16,
+    jumpPowerEnabled = false,
+    jumpPowerValue = 50,
+    infJumpEnabled = false,
+    flyEnabled = false,
+    flySpeed = 50,
+    fovEnabled = false,
+    fovValue = 70,
+    maxZoomEnabled = false,
+    maxZoomValue = 128,
+    selectedVote = "Average",
+    autoVoteEnabled = false,
+    autoReadyEnabled = false,
+    astroFarmEnabled = false,
+    selectedWeapons = {},
+    autoBuyWeaponsEnabled = false,
+    selectedMiscItem = "HeadPhone",
+    autoBuyMiscEnabled = false,
+    selectedRequestItem = "Titan-Request",
+    autoBuyRequestEnabled = false,
+    selectedUseItem = "Presents",
+    autoUseItemEnabled = false,
+    spinAmount = "1",
+    autoSkinsEnabled = false,
+    autoCharactersEnabled = false,
+    selectedHourlyItems = {},
+    hourlyPurchaseAmount = "1",
+    autoBuyHourlyEnabled = false,
+    selectedCollectibles = {},
+    collectDropEnabled = false,
+    selectedPromoCodes = {},
+    antiLagEnabled = false,
+    deleteVFXEnabled = false,
+    renderingDisabled = false,
+    antiAFKEnabled = false,
+    forceJeffreySitEnabled = false,
+    espEnabled = false,
+    tracersEnabled = false,
+    highlightColor = Color3.fromRGB(255, 0, 0),
+    tracerColor = Color3.fromRGB(255, 0, 0),
+    fullbrightEnabled = false,
+    configName = "",
+    selectedConfig = "",
+    autoLoadConfig = false,
+}
+
+local DefaultTheme = {
+    Name = "PolyHubPurple",
+    Background = Color3.fromRGB(24, 24, 27),
+    Text = Color3.fromRGB(238, 238, 240),
+    Accent = Color3.fromRGB(92, 92, 102),
+    Outline = Color3.fromRGB(63, 63, 70),
+    Placeholder = Color3.fromRGB(148, 148, 158),
+    Icon = Color3.fromRGB(212, 212, 216),
+    Button = Color3.fromRGB(39, 39, 42),
+}
+
+local Theme = {
+    Accent = DefaultTheme.Accent,
+    Background = DefaultTheme.Background,
+    Outline = DefaultTheme.Outline,
+    Text = DefaultTheme.Text,
+    Placeholder = DefaultTheme.Placeholder,
+    Button = DefaultTheme.Button,
+    Icon = DefaultTheme.Icon,
+}
+
+local ABILITY_KEYS = {
+    "E", "R", "T", "Y", "U", "I", "O", "P", "F", "G", "H", "J", "K", "L", "Z", "X", "C", "V", "B", "N", "M",
+}
+
+local VOTE_REMOTE = {
+    ["Average"] = "Normal",
+    ["Hard"] = "Hard",
+    ["Extreme"] = "VeryHard",
+    ["Insane"] = "Insane",
+    ["Nightmare"] = "Nightmare",
+    ["Boss Rush"] = "BossRush",
+    ["In the Mist"] = "ThunderStorm",
+    ["Zombie Act.1"] = nil, -- [TRACE-GAP] no Vote remote call on the sampled branch
+    ["Christmas Act.1"] = nil, -- [TRACE-GAP] no Vote remote call on the sampled branch
+    ["Hell Wave"] = "Hell",
+    ["Dark Dimension"] = "DarkDimension",
+    ["The Invasion"] = "Astro",
+    ["Astro Holdout"] = "AstroV2",
+    ["Vague Memory"] = "100MVisit",
+}
+
+local function safeCall(fn, ...)
+    local ok, a, b, c = pcall(fn, ...)
+    if not ok then
+        warn("[POLY HUB reconstruction] " .. tostring(a))
+        return nil
+    end
+    return a, b, c
+end
+
+local function getCharacterParts()
+    local character = LocalPlayer.Character
+    if not character then return nil, nil, nil end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = character:FindFirstChild("HumanoidRootPart")
+    return character, humanoid, root
+end
+
+local function getRemote(name)
+    return ReplicatedStorage:FindFirstChild(name)
+end
+
+local function fireRemote(name, ...)
+    local remote = getRemote(name)
+    if remote and remote.FireServer then
+        remote:FireServer(...)
+        return true
+    end
+    return false
+end
+
+local function notify(title, content, icon, duration)
+    if WindUI and WindUI.Notify then
+        WindUI:Notify({
+            Title = title,
+            Content = content,
+            Icon = icon or "info",
+            Duration = duration or 3,
+        })
+    end
+end
+
+local function updateStat(name, value)
+    local stats = Widgets.LiveStats
+    if stats and stats.Update then
+        stats:Update(name, value)
+    end
+end
+
+local function normalizeSelection(value)
+    if type(value) ~= "table" then return { value } end
+    local result = {}
+    for key, selected in pairs(value) do
+        if type(key) == "number" then
+            result[#result + 1] = selected
+        elseif selected then
+            result[#result + 1] = key
+        end
+    end
+    return result
+end
+
+local function contains(list, wanted)
+    for _, value in ipairs(normalizeSelection(list)) do
+        if value == wanted then return true end
+    end
+    return false
+end
+
+local function sendKey(name, down)
+    local keyCode = Enum.KeyCode[name]
+    if keyCode then
+        VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
+    end
+end
+
+local function releaseAbilityKeys()
+    for _, key in ipairs(ABILITY_KEYS) do
+        sendKey(key, false)
+    end
+end
+
+local orientationAttachment
+local orientationAlign
+
+local function clearOrientation()
+    if orientationAttachment then orientationAttachment:Destroy() end
+    if orientationAlign then orientationAlign:Destroy() end
+    orientationAttachment = nil
+    orientationAlign = nil
+end
+
+local function ensureOrientation()
+    local _, humanoid, root = getCharacterParts()
+    if not humanoid or not root then return nil end
+    clearOrientation()
+    humanoid.AutoRotate = false
+    orientationAttachment = Instance.new("Attachment", root)
+    orientationAlign = Instance.new("AlignOrientation")
+    orientationAlign.Mode = Enum.OrientationAlignmentMode.OneAttachment
+    orientationAlign.Attachment0 = orientationAttachment
+    orientationAlign.MaxTorque = math.huge
+    orientationAlign.Responsiveness = 200
+    orientationAlign.RigidityEnabled = false
+    orientationAlign.Enabled = false
+    orientationAlign.Parent = root
+    return orientationAlign
+end
+
+local flyVelocity
+local flyGyro
+
+local function stopFly()
+    if flyVelocity then flyVelocity:Destroy() end
+    if flyGyro then flyGyro:Destroy() end
+    flyVelocity = nil
+    flyGyro = nil
+    local _, humanoid = getCharacterParts()
+    if humanoid then humanoid.PlatformStand = false end
+end
+
+local function startFly()
+    local _, humanoid, root = getCharacterParts()
+    if not humanoid or not root then return end
+    stopFly()
+    humanoid.PlatformStand = true
+    flyVelocity = Instance.new("BodyVelocity")
+    flyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge)
+    flyVelocity.Velocity = Vector3.new(0, 0, 0)
+    flyVelocity.Parent = root
+    flyGyro = Instance.new("BodyGyro")
+    flyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+    flyGyro.D = 100
+    flyGyro.P = 10000
+    flyGyro.CFrame = Workspace.CurrentCamera.CFrame
+    flyGyro.Parent = root
+end
+
+local function selectedAbilityKeys()
+    local selected = normalizeSelection(State.selectedAbilities)
+    if contains(selected, "All") then return ABILITY_KEYS end
+    return selected
+end
+
+local function findNearestLivingModel()
+    -- [TRACE-INFERRED] The VM scans Workspace.Living, rejects player characters,
+    -- and measures from HumanoidRootPart. Exact game-specific filters require live instances.
+    local _, _, root = getCharacterParts()
+    local living = Workspace:FindFirstChild("Living")
+    if not root or not living then return nil end
+    local nearest, nearestDistance
+    for _, model in ipairs(living:GetChildren()) do
+        if model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
+            local targetRoot = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+            local humanoid = model:FindFirstChildOfClass("Humanoid")
+            if targetRoot and (not humanoid or humanoid.Health > 0) then
+                local distance = (targetRoot.Position - root.Position).Magnitude
+                if not nearestDistance or distance < nearestDistance then
+                    nearest = model
+                    nearestDistance = distance
+                end
+            end
+        end
+    end
+    return nearest, nearestDistance
+end
+
+local function moveTowardTarget(target)
+    -- [TRACE-INFERRED] Observable target scan/orientation preserved. The exact original
+    -- offset was not reachable with dummy game objects, so this uses a conservative 4-stud offset.
+    local _, _, root = getCharacterParts()
+    local targetRoot = target and (target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart)
+    if not root or not targetRoot then return end
+    local destination = targetRoot.CFrame * CFrame.new(0, 0, 4)
+    if State.autoFarmMode == "Teleport" then
+        root.CFrame = destination
+    else
+        local distance = (root.Position - destination.Position).Magnitude
+        local speed = math.max(1, tonumber(State.farmMovementSpeed) or 100)
+        TweenService:Create(root, TweenInfo.new(distance / speed, Enum.EasingStyle.Linear), { CFrame = destination }):Play()
+    end
+end
+
+local function buyShopItem(item)
+    if not item or item == "" then return end
+    fireRemote("ShopSystem", "Buy", item)
+end
+
+local function buyHourlyItemsOnce()
+    local amount = tonumber(State.hourlyPurchaseAmount) or 1
+    for _, item in ipairs(normalizeSelection(State.selectedHourlyItems)) do
+        for _ = 1, amount do
+            fireRemote("BuyItemFromShopHourly", item)
+            task.wait(0.05)
+        end
+    end
+end
+
+local function ensureConfigFolders()
+    if type(isfolder) ~= "function" or type(makefolder) ~= "function" then return false end
+    if not isfolder(CONFIG_ROOT) then makefolder(CONFIG_ROOT) end
+    if not isfolder(CONFIG_DIR) then makefolder(CONFIG_DIR) end
+    return true
+end
+
+local function colorToHex(color)
+    return string.format("#%02X%02X%02X", math.floor(color.R * 255 + 0.5), math.floor(color.G * 255 + 0.5), math.floor(color.B * 255 + 0.5))
+end
+
+local function themeToData()
+    return {
+        Accent = colorToHex(Theme.Accent), Background = colorToHex(Theme.Background), Outline = colorToHex(Theme.Outline),
+        Text = colorToHex(Theme.Text), Placeholder = colorToHex(Theme.Placeholder), Button = colorToHex(Theme.Button), Icon = colorToHex(Theme.Icon),
+    }
+end
+
+local function serializableState()
+    local data = {}
+    for key, value in pairs(State) do
+        if typeof(value) ~= "Color3" then data[key] = value end
+    end
+    data.Theme = themeToData()
+    return data
+end
+
+local function refreshConfigList()
+    if not ensureConfigFolders() or type(listfiles) ~= "function" then return {} end
+    local names = {}
+    for _, path in ipairs(listfiles(CONFIG_DIR)) do
+        local name = path:match("([^/\\]+)%.json$")
+        if name then names[#names + 1] = name end
+    end
+    table.sort(names)
+    local dropdown = Controls["Saved Configs"]
+    if dropdown and dropdown.Refresh then dropdown:Refresh(names) end
+    return names
+end
+
+local function applyLoadedState(data)
+    if type(data) ~= "table" then return end
+    for key, value in pairs(data) do
+        if key ~= "Theme" and State[key] ~= nil then State[key] = value end
+    end
+    local reverse = {}
+    for title, stateKey in pairs({
+        ["Farm Movement Method"] = "autoFarmMode",
+        ["Enable Auto Farm"] = "autoFarmEnabled",
+        ["Farm Movement Speed"] = "farmMovementSpeed",
+        ["Auto Farm Collect Map Items"] = "autoCollectEnabled",
+        ["Rotate To Nearest Skibidi"] = "faceNearestEnabled",
+        ["Enable Flush Aura"] = "flushAuraEnabled",
+        ["Expand Skibidi Hitboxes"] = "hitboxEnabled",
+        ["Hitbox Multiplier Size"] = "hitboxMultiplier",
+        ["Abilities to Automate"] = "selectedAbilities",
+        ["Enable Auto Abilities"] = "autoKeybindsEnabled",
+        ["Sync Abilities With Auto Farm"] = "syncAbilitiesEnabled",
+        ["Auto Fill Hp"] = "autoFillHpEnabled",
+        ["Auto Skip Helicopter"] = "skipHelicopterEnabled",
+        ["Auto Buy Titan Upgrades"] = "autoBuyTitanEnabled",
+        ["Auto Level Skill Tree"] = "autoBuySkillTreeEnabled",
+        ["Auto Utilize Titan Requests"] = "autoUseRequestEnabled",
+        ["Enable God Mode"] = "godModeEnabled",
+        ["HP Activation Threshold"] = "godModeThreshold",
+        ["Walk Speed"] = "walkSpeedEnabled",
+        ["Walk Speed Value"] = "walkSpeedValue",
+        ["Jump Power"] = "jumpPowerEnabled",
+        ["Jump Power Value"] = "jumpPowerValue",
+        ["Infinite Mid-Air Jump"] = "infJumpEnabled",
+        ["Toggle Fly"] = "flyEnabled",
+        ["Fly Value"] = "flySpeed",
+        ["Field of View (Broken)"] = "fovEnabled",
+        ["Field of View Value"] = "fovValue",
+        ["Max Zoom Distance (Broken)"] = "maxZoomEnabled",
+        ["Zoom Distance Value"] = "maxZoomValue",
+        ["Gamemode / Difficulty"] = "selectedVote",
+        ["Auto Vote"] = "autoVoteEnabled",
+        ["Auto Ready"] = "autoReadyEnabled",
+        ["Farm Astro Tokens"] = "astroFarmEnabled",
+        ["Weapons to Buy"] = "selectedWeapons",
+        ["Auto Buy Selected Weapons"] = "autoBuyWeaponsEnabled",
+        ["Misc Item to Buy"] = "selectedMiscItem",
+        ["Auto Buy Selected Misc"] = "autoBuyMiscEnabled",
+        ["Request Item"] = "selectedRequestItem",
+        ["Auto Buy Selected Request"] = "autoBuyRequestEnabled",
+        ["Item to Use"] = "selectedUseItem",
+        ["Enable Auto Use Item"] = "autoUseItemEnabled",
+        ["Spin Amount"] = "spinAmount",
+        ["Auto Roll Skins"] = "autoSkinsEnabled",
+        ["Auto Roll Characters"] = "autoCharactersEnabled",
+        ["Items to Buy"] = "selectedHourlyItems",
+        ["Purchase Amount"] = "hourlyPurchaseAmount",
+        ["Auto Buy Hourly Items"] = "autoBuyHourlyEnabled",
+        ["Items to Auto Grab"] = "selectedCollectibles",
+        ["Enable Auto Grab (W.I.P)"] = "collectDropEnabled",
+        ["Active Promo Codes"] = "selectedPromoCodes",
+        ["Remove Textures"] = "antiLagEnabled",
+        ["Delete Visual VFX"] = "deleteVFXEnabled",
+        ["Disable 3D Rendering (Unreliable mobile)"] = "renderingDisabled",
+        ["Bypass Anti-AFK Kick"] = "antiAFKEnabled",
+        ["Force Jeffrey Sit"] = "forceJeffreySitEnabled",
+        ["Enable ESP Highlights"] = "espEnabled",
+        ["Enable ESP Tracers"] = "tracersEnabled",
+        ["Highlight Color"] = "highlightColor",
+        ["Tracer Color"] = "tracerColor",
+        ["Enable Fullbright"] = "fullbrightEnabled",
+        ["Auto-Load Config on Startup"] = "autoLoadConfig",
+    }) do reverse[stateKey] = title end
+    for stateKey, title in pairs(reverse) do
+        local control = Controls[title]
+        if control and control.Set and State[stateKey] ~= nil then
+            safeCall(function() control:Set(State[stateKey]) end)
+        end
+    end
+    updateStat("Auto Farm State", State.autoFarmEnabled and "Active Running" or "Inactive")
+    updateStat("God Mode Safety", State.godModeEnabled and "Active Running" or "Deactivated")
+    updateStat("Auto Skills Status", State.autoKeybindsEnabled and "Active" or "Disabled")
+    updateStat("WalkSpeed Override", State.walkSpeedValue)
+end
+
+local function applyTheme(name)
+    WindUI:AddTheme({
+        Name = name,
+        Background = Theme.Background, Text = Theme.Text, Accent = Theme.Accent,
+        Outline = Theme.Outline, Placeholder = Theme.Placeholder, Icon = Theme.Icon, Button = Theme.Button,
+    })
+    WindUI:SetTheme(name)
+end
+
+-- Callback definitions -------------------------------------------------------
+function Callbacks.cb_createwindow_poly_hub(...)
+    return nil
+end
+
+function Callbacks.cb_bindshortcut_window(...)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: Window.Toggle(Window)
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Window.Toggle(Window)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Window.Toggle(Window)
+    if Window then Window:Toggle() end
+end
+
+function Callbacks.cb_sidebarbutton_rejoin_server(...)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: TeleportService.TeleportToPlaceInstance(TeleportService, 136020512003847, "MOCK_JOB", Players.LocalPlayer)
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: TeleportService.TeleportToPlaceInstance(TeleportService, 136020512003847, "MOCK_JOB", Players.LocalPlayer)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: TeleportService.TeleportToPlaceInstance(TeleportService, 136020512003847, "MOCK_JOB", Players.LocalPlayer)
+    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+end
+
+function Callbacks.cb_sidebarbutton_discord(...)
+    -- The original asks for setclipboard, but the invite value lived behind an unresolved runtime global.
+    -- [TRACE-GAP] Intentionally not inventing a Discord URL.
+    notify("Discord", "Invite value was not recoverable from this capture.", "link", 3)
+end
+
+function Callbacks.cb_segmented_farm_movement_method(value)
+    State.autoFarmMode = value
+end
+
+function Callbacks.cb_toggle_enable_auto_farm(value)
+    -- TRACE false: waits=0, unique_events=3
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["AutoRotate"] = true
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Auto Farm State", "Inactive")
+    -- TRACE true: waits=0, unique_events=12
+    --   CALL: Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart")
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["AutoRotate"] = false
+    --   CALL: Instance.new("Attachment", Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart"))
+    --   ... 8 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=12
+    --   CALL: Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart")
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["AutoRotate"] = false
+    --   CALL: Instance.new("Attachment", Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart"))
+    --   ... 8 more events in Uh_DEOBF_REPORT.md
+    State.autoFarmEnabled = value
+    local _, humanoid = getCharacterParts()
+    if value then
+        ensureOrientation()
+        updateStat("Auto Farm State", "Active Running")
+    else
+        clearOrientation()
+        if humanoid then humanoid.AutoRotate = true end
+        updateStat("Auto Farm State", "Inactive")
+    end
+end
+
+function Callbacks.cb_slider_farm_movement_speed(value)
+    State.farmMovementSpeed = value
+end
+
+function Callbacks.cb_toggle_auto_farm_collect_map_items(value)
+    State.autoCollectEnabled = value
+end
+
+function Callbacks.cb_toggle_rotate_to_nearest_skibidi(value)
+    -- TRACE false: waits=0, unique_events=2
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["AutoRotate"] = true
+    -- TRACE true: waits=0, unique_events=13
+    --   CALL: Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart")
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   CALL: Instance["Attachment"]#586.Destroy(Instance["Attachment"]#586)
+    --   CALL: Instance["AlignOrientation"]#587.Destroy(Instance["AlignOrientation"]#587)
+    --   ... 9 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=13
+    --   CALL: Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart")
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   CALL: Instance["Attachment"]#564.Destroy(Instance["Attachment"]#564)
+    --   CALL: Instance["AlignOrientation"]#565.Destroy(Instance["AlignOrientation"]#565)
+    --   ... 9 more events in Uh_DEOBF_REPORT.md
+    State.faceNearestEnabled = value
+    local _, humanoid = getCharacterParts()
+    if value then ensureOrientation() else clearOrientation(); if humanoid then humanoid.AutoRotate = true end end
+end
+
+function Callbacks.cb_toggle_enable_flush_aura(value)
+    State.flushAuraEnabled = value
+end
+
+function Callbacks.cb_toggle_expand_skibidi_hitboxes(value)
+    State.hitboxEnabled = value
+end
+
+function Callbacks.cb_slider_hitbox_multiplier_size(value)
+    State.hitboxMultiplier = value
+end
+
+function Callbacks.cb_dropdown_abilities_to_automate(value)
+    State.selectedAbilities = normalizeSelection(value)
+end
+
+function Callbacks.cb_toggle_enable_auto_abilities(value)
+    -- TRACE false: waits=0, unique_events=22
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Auto Skills Status", "Disabled")
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.E, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.R, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.T, false, game)
+    --   ... 18 more events in Uh_DEOBF_REPORT.md
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Auto Skills Status", "Active")
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Auto Skills Status", "Active")
+    State.autoKeybindsEnabled = value
+    updateStat("Auto Skills Status", value and "Active" or "Disabled")
+    if not value then releaseAbilityKeys() end
+end
+
+function Callbacks.cb_toggle_sync_abilities_with_auto_farm(value)
+    State.syncAbilitiesEnabled = value
+end
+
+function Callbacks.cb_button_restore_character_state(...)
+    -- TRACE false: waits=0, unique_events=27
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.E, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.R, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.T, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.Y, false, game)
+    --   ... 23 more events in Uh_DEOBF_REPORT.md
+    -- TRACE true: waits=0, unique_events=27
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.E, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.R, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.T, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.Y, false, game)
+    --   ... 23 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=27
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.E, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.R, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.T, false, game)
+    --   CALL: VirtualInputManager.SendKeyEvent(VirtualInputManager, false, Enum.KeyCode.Y, false, game)
+    --   ... 23 more events in Uh_DEOBF_REPORT.md
+    releaseAbilityKeys()
+    stopFly()
+    local _, humanoid, root = getCharacterParts()
+    if humanoid then
+        humanoid.WalkSpeed = 16
+        humanoid.PlatformStand = false
+        humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+        if root then humanoid:MoveTo(root.Position) end
+    end
+end
+
+function Callbacks.cb_toggle_auto_fill_hp(value)
+    State.autoFillHpEnabled = value
+end
+
+function Callbacks.cb_toggle_auto_skip_helicopter(value)
+    State.skipHelicopterEnabled = value
+end
+
+function Callbacks.cb_toggle_auto_buy_titan_upgrades(value)
+    State.autoBuyTitanEnabled = value
+end
+
+function Callbacks.cb_toggle_auto_level_skill_tree(value)
+    State.autoBuySkillTreeEnabled = value
+end
+
+function Callbacks.cb_toggle_auto_utilize_titan_requests(value)
+    State.autoUseRequestEnabled = value
+end
+
+function Callbacks.cb_toggle_enable_god_mode(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "God Mode Safety", "Deactivated")
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "God Mode Safety", "Active Running")
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "God Mode Safety", "Active Running")
+    State.godModeEnabled = value
+    updateStat("God Mode Safety", value and "Active Running" or "Deactivated")
+end
+
+function Callbacks.cb_slider_hp_activation_threshold(value)
+    State.godModeThreshold = value
+end
+
+function Callbacks.cb_toggle_walk_speed(value)
+    -- TRACE false: waits=0, unique_events=2
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["WalkSpeed"] = 16
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    State.walkSpeedEnabled = value
+    local _, humanoid = getCharacterParts()
+    if humanoid then humanoid.WalkSpeed = value and State.walkSpeedValue or 16 end
+    updateStat("WalkSpeed Override", value and State.walkSpeedValue or 16)
+end
+
+function Callbacks.cb_stepper_walk_speed_value(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "WalkSpeed Override", 50)
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "WalkSpeed Override", 50)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "WalkSpeed Override", 50)
+    State.walkSpeedValue = value
+    local _, humanoid = getCharacterParts()
+    if State.walkSpeedEnabled and humanoid then humanoid.WalkSpeed = value end
+    updateStat("WalkSpeed Override", value)
+end
+
+function Callbacks.cb_toggle_jump_power(value)
+    -- TRACE false: waits=0, unique_events=3
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["UseJumpPower"] = true
+    --   SET: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")["JumpPower"] = 50
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Players.LocalPlayer.Character.FindFirstChildOfClass(Players.LocalPlayer.Character, "Humanoid")
+    State.jumpPowerEnabled = value
+    local _, humanoid = getCharacterParts()
+    if humanoid then humanoid.UseJumpPower = true; humanoid.JumpPower = value and State.jumpPowerValue or 50 end
+end
+
+function Callbacks.cb_stepper_jump_power_value(value)
+    State.jumpPowerValue = value
+end
+
+function Callbacks.cb_toggle_infinite_mid_air_jump(value)
+    State.infJumpEnabled = value
+end
+
+function Callbacks.cb_togglekeybind_toggle_fly(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Fly Status", "Disabled")
+    -- TRACE true: waits=0, unique_events=14
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Fly Status", "Enabled")
+    --   CALL: Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart")
+    --   CALL: Instance.new("BodyVelocity")
+    --   CALL: Vector3.new(math.huge, math.huge, math.huge) x2
+    --   ... 10 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=14
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Fly Status", "Enabled")
+    --   CALL: Players.LocalPlayer.Character.FindFirstChild(Players.LocalPlayer.Character, "HumanoidRootPart")
+    --   CALL: Instance.new("BodyVelocity")
+    --   CALL: Vector3.new(math.huge, math.huge, math.huge) x2
+    --   ... 10 more events in Uh_DEOBF_REPORT.md
+    State.flyEnabled = value
+    if value then startFly() else stopFly() end
+    updateStat("Fly Status", value and "Enabled" or "Disabled")
+end
+
+function Callbacks.cb_slider_fly_value(value)
+    State.flySpeed = value
+end
+
+function Callbacks.cb_toggle_field_of_view_broken(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   SET: Workspace.CurrentCamera["FieldOfView"] = 70
+    State.fovEnabled = value
+    Workspace.CurrentCamera.FieldOfView = value and State.fovValue or 70
+end
+
+function Callbacks.cb_slider_field_of_view_value(value)
+    State.fovValue = value
+end
+
+function Callbacks.cb_toggle_max_zoom_distance_broken(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   SET: Players.LocalPlayer["CameraMaxZoomDistance"] = 128
+    State.maxZoomEnabled = value
+    LocalPlayer.CameraMaxZoomDistance = value and State.maxZoomValue or 128
+end
+
+function Callbacks.cb_slider_zoom_distance_value(value)
+    State.maxZoomValue = value
+end
+
+function Callbacks.cb_dropdown_gamemode_difficulty(value)
+    State.selectedVote = value
+end
+
+function Callbacks.cb_toggle_auto_vote(value)
+    State.autoVoteEnabled = value
+end
+
+function Callbacks.cb_toggle_auto_ready(value)
+    State.autoReadyEnabled = value
+end
+
+function Callbacks.cb_toggle_farm_astro_tokens(value)
+    -- TRACE false: waits=0, unique_events=4
+    --   CALL: Toggle["Auto Vote"].Set(Toggle["Auto Vote"], false)
+    --   CALL: Toggle["Auto Ready"].Set(Toggle["Auto Ready"], false)
+    --   CALL: Toggle["Enable God Mode"].Set(Toggle["Enable God Mode"], false)
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "God Mode Safety", "Deactivated")
+    -- TRACE true: waits=0, unique_events=5
+    --   CALL: Dropdown["Gamemode / Difficulty"].Set(Dropdown["Gamemode / Difficulty"], "AstroV2")
+    --   CALL: Toggle["Auto Vote"].Set(Toggle["Auto Vote"], true)
+    --   CALL: Toggle["Auto Ready"].Set(Toggle["Auto Ready"], true)
+    --   CALL: Toggle["Enable God Mode"].Set(Toggle["Enable God Mode"], true)
+    --   ... 1 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=5
+    --   CALL: Dropdown["Gamemode / Difficulty"].Set(Dropdown["Gamemode / Difficulty"], "AstroV2")
+    --   CALL: Toggle["Auto Vote"].Set(Toggle["Auto Vote"], true)
+    --   CALL: Toggle["Auto Ready"].Set(Toggle["Auto Ready"], true)
+    --   CALL: Toggle["Enable God Mode"].Set(Toggle["Enable God Mode"], true)
+    --   ... 1 more events in Uh_DEOBF_REPORT.md
+    State.astroFarmEnabled = value
+    State.autoVoteEnabled = value
+    State.autoReadyEnabled = value
+    State.godModeEnabled = value
+    for _, title in ipairs({"Auto Vote", "Auto Ready", "Enable God Mode"}) do
+        local control = Controls[title]
+        if control and control.Set then control:Set(value) end
+    end
+end
+
+function Callbacks.cb_dropdown_weapons_to_buy(value)
+    State.selectedWeapons = normalizeSelection(value)
+end
+
+function Callbacks.cb_toggle_auto_buy_selected_weapons(value)
+    State.autoBuyWeaponsEnabled = value
+end
+
+function Callbacks.cb_button_buy_selected_weapons_once(...)
+    -- TRACE false: waits=0, unique_events=2
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ChangeToCinema")
+    -- TRACE true: waits=0, unique_events=2
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ChangeToCinema")
+    -- TRACE scenario: waits=2, unique_events=5
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ChangeToCinema")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Shot Gun")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Pulse Rifle")
+    --   ... 1 more events in Uh_DEOBF_REPORT.md
+    for _, item in ipairs(normalizeSelection(State.selectedWeapons)) do buyShopItem(item); task.wait(0.05) end
+    notify("Store", "Weapons bought!", "check", 3)
+end
+
+function Callbacks.cb_dropdown_misc_item_to_buy(value)
+    State.selectedMiscItem = value
+end
+
+function Callbacks.cb_toggle_auto_buy_selected_misc(value)
+    State.autoBuyMiscEnabled = value
+end
+
+function Callbacks.cb_button_buy_selected_misc_once(...)
+    -- TRACE false: waits=0, unique_events=3
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Default")
+    --   CALL: WindUI.Notify(WindUI, {["Title"]="Store",["Icon"]="check",["Duration"]=3,["Content"]="Default bought!"})
+    -- TRACE true: waits=0, unique_events=3
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Enabled")
+    --   CALL: WindUI.Notify(WindUI, {["Icon"]="check",["Content"]="Enabled bought!",["Title"]="Store",["Duration"]=3})
+    -- TRACE scenario: waits=0, unique_events=3
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "HeadPhone")
+    --   CALL: WindUI.Notify(WindUI, {["Content"]="HeadPhone bought!",["Duration"]=3,["Title"]="Store",["Icon"]="check"})
+    buyShopItem(State.selectedMiscItem)
+    notify("Store", tostring(State.selectedMiscItem) .. " bought!", "check", 3)
+end
+
+function Callbacks.cb_dropdown_request_item(value)
+    State.selectedRequestItem = value
+end
+
+function Callbacks.cb_toggle_auto_buy_selected_request(value)
+    State.autoBuyRequestEnabled = value
+end
+
+function Callbacks.cb_button_buy_request_item_once(...)
+    -- TRACE false: waits=0, unique_events=3
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Default")
+    --   CALL: WindUI.Notify(WindUI, {["Title"]="Store",["Icon"]="check",["Duration"]=3,["Content"]="Default bought!"})
+    -- TRACE true: waits=0, unique_events=3
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Enabled")
+    --   CALL: WindUI.Notify(WindUI, {["Icon"]="check",["Content"]="Enabled bought!",["Title"]="Store",["Duration"]=3})
+    -- TRACE scenario: waits=0, unique_events=3
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "ShopSystem"), "Buy", "Titan-Request")
+    --   CALL: WindUI.Notify(WindUI, {["Content"]="Titan-Request bought!",["Duration"]=3,["Title"]="Store",["Icon"]="check"})
+    buyShopItem(State.selectedRequestItem)
+    notify("Store", tostring(State.selectedRequestItem) .. " bought!", "check", 3)
+end
+
+function Callbacks.cb_dropdown_item_to_use(value)
+    State.selectedUseItem = value
+end
+
+function Callbacks.cb_toggle_enable_auto_use_item(value)
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh.txt:1>)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh_VM_DECODED_RESOLVED.lua:2812>)
+    State.autoUseItemEnabled = value
+    if value then task.spawn(function() -- loop is also installed below
+        task.wait()
+    end) end
+end
+
+function Callbacks.cb_button_remove_helicopter(...)
+    -- TRACE false: waits=0, unique_events=2
+    --   CALL: Workspace.FindFirstChild(Workspace, "HelicopterShop")
+    --   CALL: Workspace.HelicopterShop.Destroy(Workspace.HelicopterShop)
+    -- TRACE true: waits=0, unique_events=2
+    --   CALL: Workspace.FindFirstChild(Workspace, "HelicopterShop")
+    --   CALL: Workspace.HelicopterShop.Destroy(Workspace.HelicopterShop)
+    -- TRACE scenario: waits=0, unique_events=2
+    --   CALL: Workspace.FindFirstChild(Workspace, "HelicopterShop")
+    --   CALL: Workspace.HelicopterShop.Destroy(Workspace.HelicopterShop)
+    local helicopter = Workspace:FindFirstChild("HelicopterShop")
+    if helicopter then helicopter:Destroy() end
+end
+
+function Callbacks.cb_dropdown_spin_amount(value)
+    State.spinAmount = value
+end
+
+function Callbacks.cb_toggle_auto_roll_skins(value)
+    State.autoSkinsEnabled = value
+end
+
+function Callbacks.cb_toggle_auto_roll_characters(value)
+    State.autoCharactersEnabled = value
+end
+
+function Callbacks.cb_dropdown_items_to_buy(value)
+    State.selectedHourlyItems = normalizeSelection(value)
+end
+
+function Callbacks.cb_dropdown_purchase_amount(value)
+    State.hourlyPurchaseAmount = normalizeSelection(value)
+end
+
+function Callbacks.cb_toggle_auto_buy_hourly_items(value)
+    State.autoBuyHourlyEnabled = value
+end
+
+function Callbacks.cb_button_buy_hourly_items_once(...)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh.txt:1>)
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh.txt:1>)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh_VM_DECODED_RESOLVED.lua:2812>)
+    task.spawn(buyHourlyItemsOnce)
+end
+
+function Callbacks.cb_dropdown_items_to_auto_grab(value)
+    State.selectedCollectibles = normalizeSelection(value)
+end
+
+function Callbacks.cb_toggle_enable_auto_grab_w_i_p(value)
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh.txt:1>)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh_VM_DECODED_RESOLVED.lua:2812>)
+    State.collectDropEnabled = value
+end
+
+function Callbacks.cb_dropdown_active_promo_codes(value)
+    State.selectedPromoCodes = normalizeSelection(value)
+end
+
+function Callbacks.cb_button_redeem_selected_codes(...)
+    -- TRACE scenario: waits=1, unique_events=2
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "RedeemCode")
+    --   CALL: ReplicatedStorage.FindFirstChild(ReplicatedStorage, "RedeemCode").FireServer(ReplicatedStorage.FindFirstChild(ReplicatedStorage, "RedeemCode"), 1)
+    for _, code in ipairs(normalizeSelection(State.selectedPromoCodes)) do fireRemote("RedeemCode", code); task.wait(0.05) end
+end
+
+function Callbacks.cb_toggle_remove_textures(value)
+    -- TRACE true: waits=0, unique_events=2
+    --   CALL: Workspace.GetDescendants(Workspace)
+    --   CALL: Workspace.GetDescendants(Workspace)[1].IsA(Workspace.GetDescendants(Workspace)[1], "BasePart")
+    -- TRACE scenario: waits=0, unique_events=2
+    --   CALL: Workspace.GetDescendants(Workspace)
+    --   CALL: Workspace.GetDescendants(Workspace)[1].IsA(Workspace.GetDescendants(Workspace)[1], "BasePart")
+    State.antiLagEnabled = value
+    if value then
+        for _, object in ipairs(Workspace:GetDescendants()) do
+            if object:IsA("BasePart") then object.Material = Enum.Material.SmoothPlastic end
+            if object:IsA("Texture") or object:IsA("Decal") then object.Transparency = 1 end
+        end
+    end
+end
+
+function Callbacks.cb_toggle_delete_visual_vfx(value)
+    -- TRACE false: waits=0, unique_events=2
+    --   CALL: Workspace.FindFirstChild(Workspace, "Effects")
+    --   SET: Workspace.FindFirstChild(Workspace, "Effects")["Parent"] = Workspace
+    -- TRACE true: waits=0, unique_events=2
+    --   CALL: Workspace.FindFirstChild(Workspace, "Effects")
+    --   SET: Workspace.FindFirstChild(Workspace, "Effects")["Parent"] = ReplicatedStorage
+    -- TRACE scenario: waits=0, unique_events=2
+    --   CALL: Workspace.FindFirstChild(Workspace, "Effects")
+    --   SET: Workspace.FindFirstChild(Workspace, "Effects")["Parent"] = ReplicatedStorage
+    State.deleteVFXEnabled = value
+    if value then
+        for _, object in ipairs(Workspace:GetDescendants()) do
+            if object:IsA("ParticleEmitter") or object:IsA("Trail") or object:IsA("Beam") then object:Destroy() end
+        end
+    end
+end
+
+function Callbacks.cb_toggle_disable_3d_rendering_unreliable_mobile(value)
+    State.renderingDisabled = value
+    RunService:Set3dRenderingEnabled(not value)
+    local gui = CoreGui:FindFirstChild("BlackScreenForRendering")
+    if gui then gui.Enabled = value end
+end
+
+function Callbacks.cb_toggle_bypass_anti_afk_kick(value)
+    State.antiAFKEnabled = value
+end
+
+function Callbacks.cb_toggle_force_jeffrey_sit(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   SET: Workspace.Jeffrey.NotHumanoid["Sit"] = false
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh.txt:1>)
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: task.spawn(<function:/mnt/data/Uh_VM_DECODED_RESOLVED.lua:2812>)
+    State.forceJeffreySitEnabled = value
+    local jeffrey = Workspace:FindFirstChild("Jeffrey")
+    local humanoid = jeffrey and jeffrey:FindFirstChild("NotHumanoid")
+    if humanoid then humanoid.Sit = value end
+end
+
+function Callbacks.cb_toggle_enable_esp_highlights(value)
+    -- TRACE false: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "ESP Status", "Disabled")
+    -- TRACE true: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "ESP Status", "Active")
+    -- TRACE scenario: waits=0, unique_events=1
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "ESP Status", "Active")
+    State.espEnabled = value
+    updateStat("ESP Status", value and "Active" or "Disabled")
+end
+
+function Callbacks.cb_toggle_enable_esp_tracers(value)
+    State.tracersEnabled = value
+end
+
+function Callbacks.cb_colorpicker_highlight_color(value)
+    State.highlightColor = value
+end
+
+function Callbacks.cb_colorpicker_tracer_color(value)
+    State.tracerColor = value
+end
+
+function Callbacks.cb_toggle_enable_fullbright(value)
+    State.fullbrightEnabled = value
+end
+
+function Callbacks.cb_input_config_name(value)
+    State.configName = value
+end
+
+function Callbacks.cb_dropdown_saved_configs(value)
+    State.selectedConfig = value
+end
+
+function Callbacks.cb_button_save_config(...)
+    -- TRACE false: waits=0, unique_events=9
+    --   ISFOLDER: "PolyHub" x2
+    --   MAKEFOLDER: "PolyHub" x2
+    --   ISFOLDER: "PolyHub/configs" x2
+    --   MAKEFOLDER: "PolyHub/configs" x2
+    --   ... 5 more events in Uh_DEOBF_REPORT.md
+    -- TRACE true: waits=0, unique_events=7
+    --   ISFOLDER: "PolyHub" x2
+    --   ISFOLDER: "PolyHub/configs" x2
+    --   CALL: HttpService.JSONEncode(HttpService, {["Theme"]={["Accent"]="#9b51e0",["Button"]="#6b2c91",["Placeholder"]="#a37acc",["Text"]="#FFFFFF",["Background"]="#100d14",["Outline"
+    --   WRITEFILE: "PolyHub/configs/Enabled.json", "{}"
+    --   ... 3 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=7
+    --   ISFOLDER: "PolyHub" x2
+    --   ISFOLDER: "PolyHub/configs" x2
+    --   CALL: HttpService.JSONEncode(HttpService, {["godModeEnabled"]=true,["collectDropEnabled"]=true,["selectedVote"]="AstroV2",["walkSpeedEnabled"]=true,["fovValue"]=70,["selectedRe
+    --   WRITEFILE: "PolyHub/configs/Default.json", "{}"
+    --   ... 3 more events in Uh_DEOBF_REPORT.md
+    local name = tostring(State.configName ~= "" and State.configName or "Default")
+    if not ensureConfigFolders() or type(writefile) ~= "function" then return notify("Config Manager", "Filesystem API unavailable.", "x", 3) end
+    writefile(CONFIG_DIR .. "/" .. name .. ".json", HttpService:JSONEncode(serializableState()))
+    refreshConfigList()
+    notify("Config Saved", "Saved as: " .. name, "check", 3)
+end
+
+function Callbacks.cb_button_load_config(...)
+    -- TRACE false: waits=0, unique_events=2
+    --   ISFILE: "PolyHub/configs/Default.json"
+    --   CALL: WindUI.Notify(WindUI, {["Title"]="Config Manager",["Icon"]="x",["Duration"]=3,["Content"]="Not found: Default"})
+    -- TRACE true: waits=0, unique_events=8
+    --   ISFILE: "PolyHub/configs/Enabled.json"
+    --   READFILE: "PolyHub/configs/Enabled.json"
+    --   CALL: HttpService.JSONDecode(HttpService, "")
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Auto Farm State", "Active Running")
+    --   ... 4 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=8
+    --   ISFILE: "PolyHub/configs/Default.json"
+    --   READFILE: "PolyHub/configs/Default.json"
+    --   CALL: HttpService.JSONDecode(HttpService, "")
+    --   CALL: Stats["Live Execution Statistics"].Update(Stats["Live Execution Statistics"], "Auto Farm State", "Active Running")
+    --   ... 4 more events in Uh_DEOBF_REPORT.md
+    local name = tostring(State.selectedConfig ~= "" and State.selectedConfig or "Default")
+    local path = CONFIG_DIR .. "/" .. name .. ".json"
+    if type(isfile) ~= "function" or not isfile(path) then return notify("Config Manager", "Not found: " .. name, "x", 3) end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+    if ok then applyLoadedState(data); notify("Config Loaded", "Loaded: " .. name, "check", 3) end
+end
+
+function Callbacks.cb_button_delete_config(...)
+    -- TRACE false: waits=0, unique_events=2
+    --   ISFILE: "PolyHub/configs/Default.json"
+    --   CALL: WindUI.Notify(WindUI, {["Title"]="Config Manager",["Icon"]="x",["Duration"]=3,["Content"]="Not found: Default"})
+    -- TRACE true: waits=0, unique_events=7
+    --   ISFILE: "PolyHub/configs/Enabled.json"
+    --   DELFILE: "PolyHub/configs/Enabled.json"
+    --   ISFOLDER: "PolyHub"
+    --   ISFOLDER: "PolyHub/configs"
+    --   ... 3 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=7
+    --   ISFILE: "PolyHub/configs/Default.json"
+    --   DELFILE: "PolyHub/configs/Default.json"
+    --   ISFOLDER: "PolyHub"
+    --   ISFOLDER: "PolyHub/configs"
+    --   ... 3 more events in Uh_DEOBF_REPORT.md
+    local name = tostring(State.selectedConfig ~= "" and State.selectedConfig or "Default")
+    local path = CONFIG_DIR .. "/" .. name .. ".json"
+    if type(isfile) ~= "function" or not isfile(path) then return notify("Config Manager", "Not found: " .. name, "x", 3) end
+    delfile(path); refreshConfigList(); notify("Config Deleted", "Deleted successfully.", "trash-2", 3)
+end
+
+function Callbacks.cb_button_refresh_config_list(...)
+    -- TRACE false: waits=0, unique_events=7
+    --   ISFOLDER: "PolyHub"
+    --   MAKEFOLDER: "PolyHub"
+    --   ISFOLDER: "PolyHub/configs"
+    --   MAKEFOLDER: "PolyHub/configs"
+    --   ... 3 more events in Uh_DEOBF_REPORT.md
+    -- TRACE true: waits=0, unique_events=5
+    --   ISFOLDER: "PolyHub"
+    --   ISFOLDER: "PolyHub/configs"
+    --   LISTFILES: "PolyHub/configs"
+    --   CALL: Dropdown["Saved Configs"].Refresh(Dropdown["Saved Configs"], {})
+    --   ... 1 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=5
+    --   ISFOLDER: "PolyHub"
+    --   ISFOLDER: "PolyHub/configs"
+    --   LISTFILES: "PolyHub/configs"
+    --   CALL: Dropdown["Saved Configs"].Refresh(Dropdown["Saved Configs"], {})
+    --   ... 1 more events in Uh_DEOBF_REPORT.md
+    refreshConfigList(); notify("Config Manager", "List refreshed.", "check", 2)
+end
+
+function Callbacks.cb_toggle_auto_load_config_on_startup(value)
+    -- TRACE false: waits=0, unique_events=3
+    --   ISFOLDER: "PolyHub"
+    --   MAKEFOLDER: "PolyHub"
+    --   WRITEFILE: "PolyHub/autoload.txt", "false"
+    -- TRACE true: waits=0, unique_events=2
+    --   ISFOLDER: "PolyHub"
+    --   WRITEFILE: "PolyHub/autoload.txt", "true"
+    -- TRACE scenario: waits=0, unique_events=2
+    --   ISFOLDER: "PolyHub"
+    --   WRITEFILE: "PolyHub/autoload.txt", "true"
+    State.autoLoadConfig = value
+    if ensureConfigFolders() and type(writefile) == "function" then writefile(AUTOLOAD_FILE, tostring(value)) end
+end
+
+function Callbacks.cb_colorpicker_primary_accent(value)
+    Theme.Accent = value
+end
+
+function Callbacks.cb_colorpicker_window_background(value)
+    Theme.Background = value
+end
+
+function Callbacks.cb_colorpicker_border_outline(value)
+    Theme.Outline = value
+end
+
+function Callbacks.cb_colorpicker_text_color(value)
+    Theme.Text = value
+end
+
+function Callbacks.cb_colorpicker_placeholder_color(value)
+    Theme.Placeholder = value
+end
+
+function Callbacks.cb_colorpicker_button_color(value)
+    Theme.Button = value
+end
+
+function Callbacks.cb_colorpicker_icon_color(value)
+    Theme.Icon = value
+end
+
+function Callbacks.cb_button_apply_theme(...)
+    -- TRACE false: waits=0, unique_events=13
+    --   CALL: Color3.fromRGB(92, 92, 102)
+    --   CALL: Color3.fromRGB(24, 24, 27)
+    --   CALL: Color3.fromRGB(63, 63, 70)
+    --   CALL: Color3.fromRGB(238, 238, 240)
+    --   ... 9 more events in Uh_DEOBF_REPORT.md
+    -- TRACE true: waits=0, unique_events=12
+    --   CALL: Color3.fromRGB(92, 92, 102)
+    --   CALL: Color3.fromRGB(24, 24, 27)
+    --   CALL: Color3.fromRGB(63, 63, 70)
+    --   CALL: Color3.fromRGB(238, 238, 240)
+    --   ... 8 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=12
+    --   CALL: Color3.fromRGB(92, 92, 102)
+    --   CALL: Color3.fromRGB(24, 24, 27)
+    --   CALL: Color3.fromRGB(63, 63, 70)
+    --   CALL: Color3.fromRGB(238, 238, 240)
+    --   ... 8 more events in Uh_DEOBF_REPORT.md
+    applyTheme("PolyHubCustom")
+    if ensureConfigFolders() and type(writefile) == "function" then writefile(THEME_FILE, HttpService:JSONEncode(themeToData())) end
+end
+
+function Callbacks.cb_button_reset_to_default_purple(...)
+    -- TRACE false: waits=0, unique_events=10
+    --   CALL: Color3.fromRGB(92, 92, 102)
+    --   CALL: Color3.fromRGB(24, 24, 27)
+    --   CALL: Color3.fromRGB(63, 63, 70)
+    --   CALL: Color3.fromRGB(238, 238, 240)
+    --   ... 6 more events in Uh_DEOBF_REPORT.md
+    -- TRACE true: waits=0, unique_events=11
+    --   CALL: Color3.fromRGB(92, 92, 102)
+    --   CALL: Color3.fromRGB(24, 24, 27)
+    --   CALL: Color3.fromRGB(63, 63, 70)
+    --   CALL: Color3.fromRGB(238, 238, 240)
+    --   ... 7 more events in Uh_DEOBF_REPORT.md
+    -- TRACE scenario: waits=0, unique_events=11
+    --   CALL: Color3.fromRGB(92, 92, 102)
+    --   CALL: Color3.fromRGB(24, 24, 27)
+    --   CALL: Color3.fromRGB(63, 63, 70)
+    --   CALL: Color3.fromRGB(238, 238, 240)
+    --   ... 7 more events in Uh_DEOBF_REPORT.md
+    for key, value in pairs(DefaultTheme) do if key ~= "Name" then Theme[key] = value end end
+    applyTheme("NetNullDark")
+    if type(isfile) == "function" and isfile(THEME_FILE) and type(delfile) == "function" then delfile(THEME_FILE) end
+end
+
+-- UI construction -----------------------------------------------------------
+local ok, library = pcall(function()
+    if type(loadstring) ~= "function" then
+        error("executor has no loadstring")
+    end
+
+    local source = game:HttpGet(WIND_UI_SOURCE)
+    if type(source) ~= "string" or #source < 1000 then
+        error("WindUI HTTP response is invalid/too short: " .. tostring(source))
+    end
+
+    local chunk, compileError = loadstring(source)
+    if type(chunk) ~= "function" then
+        error("WindUI compile failed: " .. tostring(compileError))
+    end
+
+    local loaded = chunk()
+    if type(loaded) ~= "table" then
+        error("WindUI returned " .. type(loaded) .. " instead of table")
+    end
+    return loaded
+end)
+if not ok or not library then
+    error("POLY HUB: failed to load WindUI: " .. tostring(library))
+end
+WindUI = library
+
+WindUI:AddTheme({["Name"]="NetNullDark",["Background"]=Color3.fromRGB(24, 24, 27),["Text"]=Color3.fromRGB(238, 238, 240),["Accent"]=Color3.fromRGB(92, 92, 102),["Outline"]=Color3.fromRGB(63, 63, 70),["Placeholder"]=Color3.fromRGB(148, 148, 158),["Icon"]=Color3.fromRGB(212, 212, 216),["Button"]=Color3.fromRGB(39, 39, 42)})
+Window = WindUI:CreateWindow({["Resizable"]=true,["Acrylic"]=false,["Folder"]="PolyHub",["Icon"]="sparkles",["Size"]=UDim2.new(0, 625, 0, 450),["User"]={["Enabled"]=true,["Callback"]=Callbacks.cb_createwindow_poly_hub,["Anonymous"]=false},["Watermark"]={["Enabled"]=true,["Opacity"]=0.5,["Text"]="",["Size"]=14,["Position"]="bottom-right"},["Topbar"]={["ButtonsType"]="Default",["Height"]=44},["Title"]="NetNull",["ModernLayout"]=true,["OpenButton"]={["Title"]="NetNull",["Icon"]="sparkles",["Draggable"]=true,["Enabled"]=true},["ScrollBarEnabled"]=true,["Theme"]="NetNullDark",["IconThemed"]=true,["ModernLayoutMergeElements"]=true,["SideBarWidth"]=200,["HideSearchBar"]=false})
+Window:Tag({["Title"]="\226\128\139v1.7.0",["Color"]=Color3.fromHex("#30ff6a"),["Radius"]=13,["Icon"]="github"})
+Window:SetBackgroundImage("rbxassetid://17582945598")
+Window:SetBackgroundImageTransparency(0.82)
+WindUI:SetTheme("NetNullDark")
+Window:BindShortcut("RightShift", Callbacks.cb_bindshortcut_window, {["EnabledWhenClosed"]=true,["Description"]="Hide/show interface."})
+WindUI:Notify({["Title"]="NetNull",["Icon"]="check",["Duration"]=5,["Content"]="Script loaded successfully!"})
+Window:SideBarLabel({["Title"]="Hub Actions",["Icon"]="zap"})
+Controls["Rejoin Server"] = Window:SideBarButton({["Title"]="Rejoin Server",["Callback"]=Callbacks.cb_sidebarbutton_rejoin_server,["Variant"]="Secondary",["Icon"]="refresh-cw"})
+Controls["Discord"] = Window:SideBarButton({["Title"]="Discord",["Callback"]=Callbacks.cb_sidebarbutton_discord,["Variant"]="Primary",["Icon"]="link"})
+Window:SideBarDivider({})
+Tabs["Dashboard"] = Window:Tab({["Title"]="Dashboard",["Border"]=true,["Icon"]="layout-dashboard",["ShowTabTitle"]=true})
+Sections["Live Overview"] = Tabs["Dashboard"]:MultiSection({["Icon"]="activity",["Title"]="Live Overview",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Window:Divider()
+Tabs["Live Stats"] = Sections["Live Overview"]:Tab({["Title"]="Live Stats",["Icon"]="activity",["Selected"]=true})
+Tabs["Workspace"] = Window:Tab({["Title"]="Workspace",["Border"]=true,["Icon"]="earth",["ShowTabTitle"]=true})
+Sections["Farm Core"] = Tabs["Workspace"]:MultiSection({["Icon"]="swords",["Desc"]="Core farm settings & Combat",["Title"]="Farm Core",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["Farm"] = Sections["Farm Core"]:Tab({["Title"]="Farm",["Icon"]="tractor",["Selected"]=true})
+Tabs["Gamemode"] = Sections["Farm Core"]:Tab({["Title"]="Gamemode",["Icon"]="globe"})
+Tabs["Combat"] = Sections["Farm Core"]:Tab({["Title"]="Combat",["Icon"]="shield-alert"})
+Tabs["Automatizations"] = Window:Tab({["Title"]="Automatizations",["Border"]=true,["Icon"]="wrench",["ShowTabTitle"]=true})
+Sections["Skills & Actions"] = Tabs["Automatizations"]:MultiSection({["Icon"]="cpu",["Desc"]="Automate stuff and god mode.",["Title"]="Skills & Actions",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["Auto Abilities"] = Sections["Skills & Actions"]:Tab({["Title"]="Auto Abilities",["Icon"]="keyboard",["Selected"]=true})
+Tabs["Game Actions"] = Sections["Skills & Actions"]:Tab({["Title"]="Game Actions",["Icon"]="play"})
+Tabs["God Mode"] = Sections["Skills & Actions"]:Tab({["Title"]="God Mode",["Icon"]="shield"})
+Tabs["Player"] = Window:Tab({["Title"]="Player",["Border"]=true,["Icon"]="user",["ShowTabTitle"]=true})
+Sections["Player Mods"] = Tabs["Player"]:MultiSection({["Icon"]="user-cog",["Desc"]="Player modifier stuff.",["Title"]="Player Mods",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["Movement"] = Sections["Player Mods"]:Tab({["Title"]="Movement",["Icon"]="move",["Selected"]=true})
+Tabs["Camera"] = Sections["Player Mods"]:Tab({["Title"]="Camera",["Icon"]="camera"})
+Tabs["Shop"] = Window:Tab({["Title"]="Shop",["Border"]=true,["Icon"]="shopping-cart",["ShowTabTitle"]=true})
+Sections["Shop & Gacha"] = Tabs["Shop"]:MultiSection({["Icon"]="store",["Desc"]="Auto buy things mostly.",["Title"]="Shop & Gacha",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["Weapons/Shop"] = Sections["Shop & Gacha"]:Tab({["Title"]="Weapons/Shop",["Icon"]="store",["Selected"]=true})
+Tabs["Gacha Roll"] = Sections["Shop & Gacha"]:Tab({["Title"]="Gacha Roll",["Icon"]="dices"})
+Tabs["Hourly Shop"] = Sections["Shop & Gacha"]:Tab({["Title"]="Hourly Shop",["Icon"]="clock"})
+Tabs["Collector Maps"] = Sections["Shop & Gacha"]:Tab({["Title"]="Collector Maps",["Icon"]="package"})
+Tabs["Promo Codes"] = Sections["Shop & Gacha"]:Tab({["Title"]="Promo Codes",["Icon"]="tag"})
+Tabs["Visuals"] = Window:Tab({["Title"]="Visuals",["Border"]=true,["Icon"]="eye",["ShowTabTitle"]=true})
+Sections["Visual Enhancements"] = Tabs["Visuals"]:MultiSection({["Icon"]="eye",["Desc"]="Good for gameplays.",["Title"]="Visual Enhancements",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["ESP"] = Sections["Visual Enhancements"]:Tab({["Title"]="ESP",["Icon"]="scan",["Selected"]=true})
+Tabs["Lighting"] = Sections["Visual Enhancements"]:Tab({["Title"]="Lighting",["Icon"]="sun"})
+Tabs["Optimizations"] = Sections["Visual Enhancements"]:Tab({["Title"]="Optimizations",["Icon"]="zap"})
+Tabs["Blatant"] = Window:Tab({["Title"]="Blatant",["Border"]=true,["Icon"]="laugh",["ShowTabTitle"]=true})
+Tabs["Settings"] = Window:Tab({["Title"]="Settings",["Border"]=true,["Icon"]="settings",["ShowTabTitle"]=true})
+Sections["Configurations"] = Tabs["Settings"]:MultiSection({["Icon"]="settings",["Desc"]="Save your settings here.",["Title"]="Configurations",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["Data Manager"] = Sections["Configurations"]:Tab({["Title"]="Data Manager",["Icon"]="save",["Selected"]=true})
+Tabs["Theme"] = Window:Tab({["Title"]="Theme",["Border"]=true,["Icon"]="palette",["ShowTabTitle"]=true})
+Sections["Interface Styling"] = Tabs["Theme"]:MultiSection({["Icon"]="brush",["Title"]="Interface Styling",["Opened"]=true,["Box"]=true,["BoxBorder"]=true})
+Tabs["Color Customizer"] = Sections["Interface Styling"]:Tab({["Title"]="Color Customizer",["Icon"]="droplet",["Selected"]=true})
+Window:SelectTab(Tabs["Dashboard"])
+Tabs["Live Stats"]:Video({["Video"]="rbxassetid://5608268502",["Height"]=220,["Visible"]=true,["Looped"]=true,["Padding"]=6,["Radius"]=16,["Volume"]=1,["Playing"]=true})
+Widgets.LiveStats = Tabs["Live Stats"]:Stats({
+    Title = "Live Execution Statistics",
+    Desc = "Real-time tracking of script execution.",
+    Items = {
+        { Title = "Auto Farm State", Value = "Inactive" },
+        { Title = "Current Target", Value = "Scanning..." },
+        { Title = "Auto Skills Status", Value = "Disabled" },
+        { Title = "God Mode Safety", Value = "Deactivated" },
+        { Title = "WalkSpeed Override", Value = 16 },
+        { Title = "Fly Status", Value = "Disabled" },
+        { Title = "ESP Status", Value = "Disabled" },
+    },
+})
+Controls["Farm Movement Method"] = Tabs["Farm"]:Segmented({
+    Title = "Farm Movement Method",
+    Desc = "Tween is just smooth while teleport instant, you can use teleport freely btw",
+    Options = {
+        { Title = "Tween", Icon = "activity" },
+        { Title = "Teleport", Icon = "zap" },
+    },
+    Value = "Tween",
+    Callback = Callbacks.cb_segmented_farm_movement_method,
+})
+Controls["Enable Auto Farm"] = Tabs["Farm"]:Toggle({["Icon"]="play",["Desc"]="Self explanatory don't you think?",["Callback"]=Callbacks.cb_toggle_enable_auto_farm,["Type"]="Toggle",["Title"]="Enable Auto Farm",["Value"]=false})
+Controls["Farm Movement Speed"] = Tabs["Farm"]:Slider({["Icons"]={["To"]="arrow-big-up-dash",["From"]="turtle"},["Desc"]="Faster means better here",["Step"]=1,["Title"]="Farm Movement Speed",["Callback"]=Callbacks.cb_slider_farm_movement_speed,["IsTextbox"]=false,["Value"]={["Min"]=0,["Default"]=100,["Max"]=100}})
+Tabs["Farm"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Auto Farm Collect Map Items"] = Tabs["Farm"]:Toggle({["Desc"]="Needs to be used with autofarm",["Callback"]=Callbacks.cb_toggle_auto_farm_collect_map_items,["Type"]="Toggle",["Title"]="Auto Farm Collect Map Items",["Value"]=false})
+Controls["Rotate To Nearest Skibidi"] = Tabs["Combat"]:Toggle({["Desc"]="Rotates your character toward the closest skibidi or astro",["Callback"]=Callbacks.cb_toggle_rotate_to_nearest_skibidi,["Type"]="Toggle",["Title"]="Rotate To Nearest Skibidi",["Value"]=false})
+Controls["Enable Flush Aura"] = Tabs["Combat"]:Toggle({["Desc"]="Interacts with toilet's flush",["Callback"]=Callbacks.cb_toggle_enable_flush_aura,["Type"]="Toggle",["Title"]="Enable Flush Aura",["Value"]=false})
+Tabs["Combat"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Expand Skibidi Hitboxes"] = Tabs["Combat"]:Toggle({["Desc"]="Work in progress",["Callback"]=Callbacks.cb_toggle_expand_skibidi_hitboxes,["Type"]="Toggle",["Title"]="Expand Skibidi Hitboxes",["Value"]=false})
+Controls["Hitbox Multiplier Size"] = Tabs["Combat"]:Slider({["Desc"]="Self explanatory",["Step"]=1,["Title"]="Hitbox Multiplier Size",["Callback"]=Callbacks.cb_slider_hitbox_multiplier_size,["IsTextbox"]=true,["Value"]={["Min"]=1,["Default"]=5,["Max"]=15}})
+Controls["Abilities to Automate"] = Tabs["Auto Abilities"]:Dropdown({ Title = "Abilities to Automate", Desc = "On mobile freezes you, better use while auto farming", Multi = true, Values = {"All", "E", "R", "T", "Y", "U", "I", "O", "P", "F", "G", "H", "J", "K", "L", "Z", "X", "C", "V", "B", "N", "M"}, Value = {"All"}, Callback = Callbacks.cb_dropdown_abilities_to_automate })
+Tabs["Auto Abilities"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Enable Auto Abilities"] = Tabs["Auto Abilities"]:Toggle({["Desc"]="Continuously presses the selected abilities",["Callback"]=Callbacks.cb_toggle_enable_auto_abilities,["Type"]="Toggle",["Title"]="Enable Auto Abilities",["Value"]=false})
+Controls["Sync Abilities With Auto Farm"] = Tabs["Auto Abilities"]:Toggle({["Desc"]="Only uses skills when attacking a target.",["Callback"]=Callbacks.cb_toggle_sync_abilities_with_auto_farm,["Type"]="Toggle",["Title"]="Sync Abilities With Auto Farm",["Value"]=false})
+Controls["Restore Character State"] = Tabs["Auto Abilities"]:Button({["Title"]="Restore Character State",["Desc"]="Fixes your character if it gets stuck (1\226\128\14710 sec delay)",["Callback"]=Callbacks.cb_button_restore_character_state,["Icon"]="refresh-cw"})
+Controls["Auto Fill Hp"] = Tabs["Game Actions"]:Toggle({["Desc"]="Needs in-game money",["Callback"]=Callbacks.cb_toggle_auto_fill_hp,["Type"]="Toggle",["Title"]="Auto Fill Hp",["Value"]=false})
+Controls["Auto Skip Helicopter"] = Tabs["Game Actions"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_auto_skip_helicopter,["Type"]="Toggle",["Title"]="Auto Skip Helicopter",["Value"]=false})
+Controls["Auto Buy Titan Upgrades"] = Tabs["Game Actions"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_auto_buy_titan_upgrades,["Type"]="Toggle",["Title"]="Auto Buy Titan Upgrades",["Value"]=false})
+Tabs["Game Actions"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Auto Level Skill Tree"] = Tabs["Game Actions"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_auto_level_skill_tree,["Type"]="Toggle",["Title"]="Auto Level Skill Tree",["Value"]=false})
+Controls["Auto Utilize Titan Requests"] = Tabs["Game Actions"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_auto_utilize_titan_requests,["Type"]="Toggle",["Title"]="Auto Utilize Titan Requests",["Value"]=false})
+Controls["Enable God Mode"] = Tabs["God Mode"]:Toggle({["Desc"]="Kills your character when HP drops below threshold to trigger respawn",["Callback"]=Callbacks.cb_toggle_enable_god_mode,["Type"]="Toggle",["Title"]="Enable God Mode",["Value"]=false})
+Controls["HP Activation Threshold"] = Tabs["God Mode"]:Slider({["Desc"]="God Mode triggers when HP falls below this percentage.",["Step"]=1,["Title"]="HP Activation Threshold",["Callback"]=Callbacks.cb_slider_hp_activation_threshold,["IsTextbox"]=true,["Value"]={["Min"]=1,["Default"]=30,["Max"]=99}})
+Controls["Walk Speed"] = Tabs["Movement"]:Toggle({["Desc"]="Self explanatory",["Callback"]=Callbacks.cb_toggle_walk_speed,["Type"]="Toggle",["Title"]="Walk Speed",["Value"]=false})
+Controls["Walk Speed Value"] = Tabs["Movement"]:Stepper({["Desc"]="Title says it all dont you think",["Step"]=2,["Title"]="Walk Speed Value",["Callback"]=Callbacks.cb_stepper_walk_speed_value,["Value"]={["Min"]=16,["Default"]=16,["Max"]=300}})
+Tabs["Movement"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Jump Power"] = Tabs["Movement"]:Toggle({["Desc"]="Changes the jump height",["Callback"]=Callbacks.cb_toggle_jump_power,["Type"]="Toggle",["Title"]="Jump Power",["Value"]=false})
+Controls["Jump Power Value"] = Tabs["Movement"]:Stepper({["Desc"]="Changes the value",["Step"]=5,["Title"]="Jump Power Value",["Callback"]=Callbacks.cb_stepper_jump_power_value,["Value"]={["Min"]=50,["Default"]=50,["Max"]=500}})
+Controls["Infinite Mid-Air Jump"] = Tabs["Movement"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_infinite_mid_air_jump,["Type"]="Toggle",["Title"]="Infinite Mid-Air Jump",["Value"]=false})
+Controls["Toggle Fly"] = Tabs["Movement"]:ToggleKeybind({["Icon"]="bird",["Desc"]="Makes you fly",["Callback"]=Callbacks.cb_togglekeybind_toggle_fly,["Type"]="Toggle",["Title"]="Toggle Fly",["Keybind"]="F",["Value"]=false})
+Controls["Fly Value"] = Tabs["Movement"]:Slider({["Desc"]="",["Step"]=1,["Title"]="Fly Value",["Callback"]=Callbacks.cb_slider_fly_value,["IsTextbox"]=true,["Value"]={["Min"]=16,["Default"]=50,["Max"]=300}})
+Controls["Field of View (Broken)"] = Tabs["Camera"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_field_of_view_broken,["Type"]="Toggle",["Title"]="Field of View (Broken)",["Value"]=false})
+Controls["Field of View Value"] = Tabs["Camera"]:Slider({["Desc"]="",["Step"]=1,["Title"]="Field of View Value",["Callback"]=Callbacks.cb_slider_field_of_view_value,["IsTextbox"]=true,["Value"]={["Min"]=70,["Default"]=70,["Max"]=120}})
+Tabs["Camera"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Max Zoom Distance (Broken)"] = Tabs["Camera"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_max_zoom_distance_broken,["Type"]="Toggle",["Title"]="Max Zoom Distance (Broken)",["Value"]=false})
+Controls["Zoom Distance Value"] = Tabs["Camera"]:Slider({["Desc"]="",["Step"]=1,["Title"]="Zoom Distance Value",["Callback"]=Callbacks.cb_slider_zoom_distance_value,["IsTextbox"]=true,["Value"]={["Min"]=128,["Default"]=128,["Max"]=10000}})
+Controls["Gamemode / Difficulty"] = Tabs["Gamemode"]:Dropdown({["Desc"]="Lets you select the vote mode",["Callback"]=Callbacks.cb_dropdown_gamemode_difficulty,["Title"]="Gamemode / Difficulty",["Values"]={[1]="Average",[2]="Hard",[3]="Extreme",[4]="Insane",[5]="Nightmare",[6]="Boss Rush",[7]="In the Mist",[8]="Zombie Act.1",[9]="Christmas Act.1",[10]="Hell Wave",[11]="Dark Dimension",[12]="The Invasion",[13]="Astro Holdout",[14]="Vague Memory"},["Value"]="Average"})
+Tabs["Gamemode"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Auto Vote"] = Tabs["Gamemode"]:Toggle({["Desc"]="Automatically votes for the selected gamemode",["Callback"]=Callbacks.cb_toggle_auto_vote,["Type"]="Toggle",["Title"]="Auto Vote",["Value"]=false})
+Controls["Auto Ready"] = Tabs["Gamemode"]:Toggle({["Desc"]="Automatically readies up each round",["Callback"]=Callbacks.cb_toggle_auto_ready,["Type"]="Toggle",["Title"]="Auto Ready",["Value"]=false})
+Controls["Farm Astro Tokens"] = Tabs["Farm"]:Toggle({["Desc"]="Please read text below",["Callback"]=Callbacks.cb_toggle_farm_astro_tokens,["Type"]="Toggle",["Title"]="Farm Astro Tokens",["Value"]=false})
+Tabs["Farm"]:Paragraph({["Title"]="\226\154\160\239\184\143 READ FOR ASTRO TOKEN FARM \226\154\160\239\184\143",["Desc"]="Astro token farm activates god mode, auto vote and auto ready but you need to put the gamemode to Astro Holdout, thanks for your attention"})
+Controls["Weapons to Buy"] = Tabs["Weapons/Shop"]:Dropdown({["Desc"]="",["Multi"]=true,["Title"]="Weapons to Buy",["Values"]={[1]="Shot Gun",[2]="Pulse Rifle",[3]="Shot Harpoon Gun",[4]="Harpoon Gun",[5]="EPD",[6]="Small Laser Gun",[7]="Stungun",[8]="Tazer Sniper",[9]="Tazer Gun",[10]="Astro Blaster"},["Callback"]=Callbacks.cb_dropdown_weapons_to_buy})
+Controls["Auto Buy Selected Weapons"] = Tabs["Weapons/Shop"]:Toggle({["Desc"]="Automatically buys the selected weapons every 0.5 seconds.",["Callback"]=Callbacks.cb_toggle_auto_buy_selected_weapons,["Type"]="Toggle",["Title"]="Auto Buy Selected Weapons",["Value"]=false})
+Controls["Buy Selected Weapons Once"] = Tabs["Weapons/Shop"]:Button({["Title"]="Buy Selected Weapons Once",["Desc"]="Buys the selected weapons a single time.",["Callback"]=Callbacks.cb_button_buy_selected_weapons_once,["Icon"]="shopping-cart"})
+Tabs["Weapons/Shop"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Misc Item to Buy"] = Tabs["Weapons/Shop"]:Dropdown({["Desc"]="",["Callback"]=Callbacks.cb_dropdown_misc_item_to_buy,["Title"]="Misc Item to Buy",["Values"]={[1]="HeadPhone",[2]="Grenade",[3]="Jetpack",[4]="Lens"},["Value"]="HeadPhone"})
+Controls["Auto Buy Selected Misc"] = Tabs["Weapons/Shop"]:Toggle({["Desc"]="Automatically buys the selected misc item.",["Callback"]=Callbacks.cb_toggle_auto_buy_selected_misc,["Type"]="Toggle",["Title"]="Auto Buy Selected Misc",["Value"]=false})
+Controls["Buy Selected Misc Once"] = Tabs["Weapons/Shop"]:Button({["Title"]="Buy Selected Misc Once",["Desc"]="Buys the selected misc item a single time.",["Callback"]=Callbacks.cb_button_buy_selected_misc_once,["Icon"]="shopping-cart"})
+Controls["Request Item"] = Tabs["Weapons/Shop"]:Dropdown({["Desc"]="",["Callback"]=Callbacks.cb_dropdown_request_item,["Title"]="Request Item",["Values"]={[1]="Titan-Request",[2]="SpecialTitan-Request",[3]="Speaker-Request"},["Value"]="Titan-Request"})
+Controls["Auto Buy Selected Request"] = Tabs["Weapons/Shop"]:Toggle({["Desc"]="Automatically buys the selected request item.",["Callback"]=Callbacks.cb_toggle_auto_buy_selected_request,["Type"]="Toggle",["Title"]="Auto Buy Selected Request",["Value"]=false})
+Controls["Buy Request Item Once"] = Tabs["Weapons/Shop"]:Button({["Title"]="Buy Request Item Once",["Desc"]="Buys the selected request item a single time.",["Callback"]=Callbacks.cb_button_buy_request_item_once,["Icon"]="shopping-cart"})
+Controls["Item to Use"] = Tabs["Weapons/Shop"]:Dropdown({["Desc"]="",["Callback"]=Callbacks.cb_dropdown_item_to_use,["Title"]="Item to Use",["Values"]={[1]="Presents"},["Value"]="Presents"})
+Controls["Enable Auto Use Item"] = Tabs["Weapons/Shop"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_enable_auto_use_item,["Type"]="Toggle",["Title"]="Enable Auto Use Item",["Value"]=false})
+Controls["Remove Helicopter"] = Tabs["Weapons/Shop"]:Button({["Title"]="Remove Helicopter",["Desc"]="Deletes the helicopter model to reduce lag.",["Callback"]=Callbacks.cb_button_remove_helicopter,["Icon"]="trash"})
+Controls["Spin Amount"] = Tabs["Gacha Roll"]:Dropdown({["Desc"]="How many spins will it do",["Callback"]=Callbacks.cb_dropdown_spin_amount,["Title"]="Spin Amount",["Values"]={[1]="1",[2]="10",[3]="Lucky Spin"},["Value"]="1"})
+Tabs["Gacha Roll"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Auto Roll Skins"] = Tabs["Gacha Roll"]:Toggle({["Desc"]="For the skins",["Callback"]=Callbacks.cb_toggle_auto_roll_skins,["Type"]="Toggle",["Title"]="Auto Roll Skins",["Value"]=false})
+Controls["Auto Roll Characters"] = Tabs["Gacha Roll"]:Toggle({["Desc"]="For the characters",["Callback"]=Callbacks.cb_toggle_auto_roll_characters,["Type"]="Toggle",["Title"]="Auto Roll Characters",["Value"]=false})
+Controls["Items to Buy"] = Tabs["Hourly Shop"]:Dropdown({ Title = "Items to Buy", Desc = "Select multiple items", Multi = true, Values = {"LuckPotionI", "LuckPotionII", "LuckPotionIII", "S-Ember", "BSX2:30", "BSX2:60", "BSX2:360", "FlashDrive#1", "FlashDrive#2", "FlashDrive#3", "FlashDrive#4", "FlashDrive#5", "FlashDrive#6", "Drive#A", "Drive#B", "Drive#C", "Drive#E", "Drive#Sdfe0", "MasterCard:Normal", "MasterCard:NormalII"}, Callback = Callbacks.cb_dropdown_items_to_buy })
+Controls["Purchase Amount"] = Tabs["Hourly Shop"]:Dropdown({["Desc"]="",["Multi"]=true,["Title"]="Purchase Amount",["Values"]={[1]="1",[2]="2",[3]="3",[4]="4",[5]="5"},["Callback"]=Callbacks.cb_dropdown_purchase_amount})
+Tabs["Hourly Shop"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Auto Buy Hourly Items"] = Tabs["Hourly Shop"]:Toggle({["Desc"]="Continuously buys the selected items in the background.",["Callback"]=Callbacks.cb_toggle_auto_buy_hourly_items,["Type"]="Toggle",["Title"]="Auto Buy Hourly Items",["Value"]=false})
+Controls["Buy Hourly Items Once"] = Tabs["Hourly Shop"]:Button({["Title"]="Buy Hourly Items Once",["Desc"]="Buys selected items immediately",["Callback"]=Callbacks.cb_button_buy_hourly_items_once,["Icon"]="shopping-cart"})
+Controls["Items to Auto Grab"] = Tabs["Collector Maps"]:Dropdown({["Desc"]="",["Multi"]=true,["Title"]="Items to Auto Grab",["Values"]={[1]="Clock Spider",[2]="Transmitter",[3]="Flash Drive",[4]="Astro Samples",[5]="X-18",[6]="The Present"},["Callback"]=Callbacks.cb_dropdown_items_to_auto_grab})
+Tabs["Collector Maps"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Enable Auto Grab (W.I.P)"] = Tabs["Collector Maps"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_enable_auto_grab_w_i_p,["Type"]="Toggle",["Title"]="Enable Auto Grab (W.I.P)",["Value"]=false})
+Controls["Active Promo Codes"] = Tabs["Promo Codes"]:Dropdown({["Desc"]="",["Multi"]=true,["Title"]="Active Promo Codes",["Values"]={[1]="ImSorryGuys14"},["Callback"]=Callbacks.cb_dropdown_active_promo_codes})
+Tabs["Promo Codes"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Redeem Selected Codes"] = Tabs["Promo Codes"]:Button({["Title"]="Redeem Selected Codes",["Desc"]="",["Callback"]=Callbacks.cb_button_redeem_selected_codes,["Icon"]="tag"})
+Controls["Remove Textures"] = Tabs["Optimizations"]:Toggle({["Desc"]="Reduces lag by removing materials.",["Callback"]=Callbacks.cb_toggle_remove_textures,["Type"]="Toggle",["Title"]="Remove Textures",["Value"]=false})
+Controls["Delete Visual VFX"] = Tabs["Optimizations"]:Toggle({["Desc"]="Removes game visual effects.",["Callback"]=Callbacks.cb_toggle_delete_visual_vfx,["Type"]="Toggle",["Title"]="Delete Visual VFX",["Value"]=false})
+Controls["Disable 3D Rendering (Unreliable mobile)"] = Tabs["Optimizations"]:Toggle({["Desc"]="Black screen to reduce GPU usage.",["Callback"]=Callbacks.cb_toggle_disable_3d_rendering_unreliable_mobile,["Type"]="Toggle",["Title"]="Disable 3D Rendering (Unreliable mobile)",["Value"]=false})
+Controls["Bypass Anti-AFK Kick"] = Tabs["Optimizations"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_bypass_anti_afk_kick,["Type"]="Toggle",["Title"]="Bypass Anti-AFK Kick",["Value"]=false})
+Controls["Force Jeffrey Sit"] = Tabs["Optimizations"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_force_jeffrey_sit,["Type"]="Toggle",["Title"]="Force Jeffrey Sit",["Value"]=false})
+Controls["Enable ESP Highlights"] = Tabs["ESP"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_enable_esp_highlights,["Type"]="Toggle",["Title"]="Enable ESP Highlights",["Value"]=false})
+Controls["Enable ESP Tracers"] = Tabs["ESP"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_enable_esp_tracers,["Type"]="Toggle",["Title"]="Enable ESP Tracers",["Value"]=false})
+Tabs["ESP"]:Divider({["Thickness"]=1.5,["Color"]="#ffffff",["Padding"]=6})
+Controls["Highlight Color"] = Tabs["ESP"]:Colorpicker({["Title"]="Highlight Color",["Callback"]=Callbacks.cb_colorpicker_highlight_color,["Default"]=Color3.fromRGB(255, 0, 0)})
+Controls["Tracer Color"] = Tabs["ESP"]:Colorpicker({["Title"]="Tracer Color",["Callback"]=Callbacks.cb_colorpicker_tracer_color,["Default"]=Color3.fromRGB(255, 0, 0)})
+Controls["Enable Fullbright"] = Tabs["Lighting"]:Toggle({["Desc"]="",["Callback"]=Callbacks.cb_toggle_enable_fullbright,["Type"]="Toggle",["Title"]="Enable Fullbright",["Value"]=false})
+Tabs["Data Manager"]:Paragraph({["Title"]="Configuration Manager",["Desc"]="Save, load and delete named configs. Stores all current toggle, slider and setting values."})
+Controls["Config Name"] = Tabs["Data Manager"]:Input({["Title"]="Config Name",["Desc"]="Type a name then press Save.",["Callback"]=Callbacks.cb_input_config_name,["Placeholder"]="e.g. AstroSetup"})
+Controls["Saved Configs"] = Tabs["Data Manager"]:Dropdown({["Desc"]="Select a config to load or delete.",["Callback"]=Callbacks.cb_dropdown_saved_configs,["Title"]="Saved Configs",["Values"]={},["Value"]=""})
+Controls["Save Config"] = Tabs["Data Manager"]:Button({["Title"]="Save Config",["Desc"]="Saves current settings under the typed name.",["Callback"]=Callbacks.cb_button_save_config,["Icon"]="save"})
+Controls["Load Config"] = Tabs["Data Manager"]:Button({["Title"]="Load Config",["Desc"]="Applies the selected config.",["Callback"]=Callbacks.cb_button_load_config,["Icon"]="upload"})
+Controls["Delete Config"] = Tabs["Data Manager"]:Button({["Title"]="Delete Config",["Desc"]="Permanently deletes the selected config.",["Callback"]=Callbacks.cb_button_delete_config,["Icon"]="trash-2"})
+Controls["Refresh Config List"] = Tabs["Data Manager"]:Button({["Title"]="Refresh Config List",["Desc"]="Reloads the dropdown from disk.",["Callback"]=Callbacks.cb_button_refresh_config_list,["Icon"]="refresh-cw"})
+Controls["Auto-Load Config on Startup"] = Tabs["Data Manager"]:Toggle({["Desc"]="Saves settings for next time.",["Callback"]=Callbacks.cb_toggle_auto_load_config_on_startup,["Type"]="Toggle",["Title"]="Auto-Load Config on Startup",["Value"]=false})
+Controls["Primary Accent"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Primary Accent",["Callback"]=Callbacks.cb_colorpicker_primary_accent,["Default"]=Color3.fromRGB(92, 92, 102)})
+Controls["Window Background"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Window Background",["Callback"]=Callbacks.cb_colorpicker_window_background,["Default"]=Color3.fromRGB(24, 24, 27)})
+Controls["Border Outline"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Border Outline",["Callback"]=Callbacks.cb_colorpicker_border_outline,["Default"]=Color3.fromRGB(63, 63, 70)})
+Controls["Text Color"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Text Color",["Callback"]=Callbacks.cb_colorpicker_text_color,["Default"]=Color3.fromRGB(238, 238, 240)})
+Controls["Placeholder Color"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Placeholder Color",["Callback"]=Callbacks.cb_colorpicker_placeholder_color,["Default"]=Color3.fromRGB(148, 148, 158)})
+Controls["Button Color"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Button Color",["Callback"]=Callbacks.cb_colorpicker_button_color,["Default"]=Color3.fromRGB(39, 39, 42)})
+Controls["Icon Color"] = Tabs["Color Customizer"]:Colorpicker({["Title"]="Icon Color",["Callback"]=Callbacks.cb_colorpicker_icon_color,["Default"]=Color3.fromRGB(212, 212, 216)})
+Controls["Apply Theme"] = Tabs["Color Customizer"]:Button({["Title"]="Apply Theme",["Callback"]=Callbacks.cb_button_apply_theme,["Icon"]="check-circle"})
+Controls["Reset to Default Purple"] = Tabs["Color Customizer"]:Button({["Title"]="Reset to Default Purple",["Callback"]=Callbacks.cb_button_reset_to_default_purple,["Icon"]="rotate-ccw"})
+
+-- Runtime/event reconstruction ---------------------------------------------
+local blackScreen = Instance.new("ScreenGui")
+blackScreen.Name = "BlackScreenForRendering"
+blackScreen.DisplayOrder = 2147483647
+blackScreen.IgnoreGuiInset = true
+blackScreen.Enabled = false
+blackScreen.Parent = CoreGui
+local blackFrame = Instance.new("Frame")
+blackFrame.Size = UDim2.fromScale(1, 1)
+blackFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+blackFrame.BorderSizePixel = 0
+blackFrame.Parent = blackScreen
+
+LocalPlayer.Idled:Connect(function()
+    if not State.antiAFKEnabled then return end
+    -- [TRACE-EXACT]
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+    VirtualUser:Button2Down(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+    task.wait()
+    VirtualUser:Button2Up(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.RightShift, false, game)
+    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.RightShift, false, game)
+end)
+
+UserInputService.JumpRequest:Connect(function()
+    if not State.infJumpEnabled then return end
+    local _, humanoid = getCharacterParts()
+    if humanoid then humanoid:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+
+GuiService.ErrorMessageChanged:Connect(function()
+    -- [TRACE-GAP] A connection exists, but the emulator could not trigger its string condition.
+end)
+
+RunService.Heartbeat:Connect(function()
+    local _, humanoid, root = getCharacterParts()
+    if humanoid then
+        if State.walkSpeedEnabled then humanoid.WalkSpeed = State.walkSpeedValue end
+        if State.jumpPowerEnabled then humanoid.UseJumpPower = true; humanoid.JumpPower = State.jumpPowerValue end
+    end
+    if State.fovEnabled then Workspace.CurrentCamera.FieldOfView = State.fovValue end
+    if State.maxZoomEnabled then LocalPlayer.CameraMaxZoomDistance = State.maxZoomValue end
+
+    if State.flyEnabled and root and flyVelocity and flyGyro then
+        local camera = Workspace.CurrentCamera
+        local direction = Vector3.new(0, 0, 0)
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then direction = direction + camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then direction = direction - camera.CFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then direction = direction - camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then direction = direction + camera.CFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then direction = direction + Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then direction = direction - Vector3.new(0, 1, 0) end
+        flyVelocity.Velocity = direction.Magnitude > 0 and direction.Unit * State.flySpeed or Vector3.new(0, 0, 0)
+        flyGyro.CFrame = camera.CFrame
+    end
+
+    if State.astroFarmEnabled and root then
+        local map = Workspace:FindFirstChild("Map")
+        local circle = map and map:FindFirstChild("Circle")
+        if circle then
+            root.Velocity = Vector3.new(0, 0, 0)
+            root.CFrame = CFrame.new(circle.Position + Vector3.new(0, 3, 0))
+        end
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function()
+    task.wait()
+    if State.flyEnabled then startFly() end
+    if State.autoFarmEnabled or State.faceNearestEnabled then ensureOrientation() end
+end)
+
+local function loop(interval, callback)
+    task.spawn(function()
+        while task.wait(interval) do
+            local ok, err = pcall(callback)
+            if not ok then warn("[POLY HUB loop] " .. tostring(err)) end
+        end
+    end)
+end
+
+loop(0.10, function()
+    if State.godModeEnabled then
+        local _, humanoid = getCharacterParts()
+        if humanoid and humanoid.MaxHealth > 0 and humanoid.Health / humanoid.MaxHealth * 100 <= State.godModeThreshold then
+            humanoid.Health = 0
+        end
+    end
+end)
+
+loop(0.10, function()
+    if not State.autoFarmEnabled and not State.faceNearestEnabled and not State.hitboxEnabled and not State.flushAuraEnabled then return end
+    local target = findNearestLivingModel()
+    updateStat("Current Target", target and target.Name or "Scanning...")
+    if not target then return end
+    local _, _, root = getCharacterParts()
+    local targetRoot = target:FindFirstChild("HumanoidRootPart") or target.PrimaryPart
+    if State.autoFarmEnabled then moveTowardTarget(target) end
+    if State.faceNearestEnabled and orientationAlign and root and targetRoot then
+        orientationAlign.Enabled = true
+        orientationAlign.CFrame = CFrame.lookAt(root.Position, targetRoot.Position)
+    end
+    if State.hitboxEnabled and targetRoot then
+        targetRoot.Size = Vector3.new(2, 2, 1) * State.hitboxMultiplier
+        targetRoot.CanCollide = false
+        targetRoot.Transparency = 0.7
+    end
+    if State.flushAuraEnabled and type(fireproximityprompt) == "function" then
+        for _, object in ipairs(target:GetDescendants()) do
+            if object:IsA("ProximityPrompt") then fireproximityprompt(object) end
+        end
+    end
+end)
+
+loop(0.12, function()
+    if not State.autoKeybindsEnabled then return end
+    if State.syncAbilitiesEnabled and not State.autoFarmEnabled then return end
+    for _, key in ipairs(selectedAbilityKeys()) do
+        sendKey(key, true)
+        task.wait(0.02)
+        sendKey(key, false)
+    end
+end)
+
+loop(0.50, function()
+    if State.skipHelicopterEnabled then fireRemote("SkipHelicopter") end
+    if State.autoVoteEnabled then
+        local vote = VOTE_REMOTE[State.selectedVote]
+        if vote then fireRemote("Vote", vote) end
+    end
+    if State.autoReadyEnabled then fireRemote("GetReadyRemote", "1", true) end
+    if State.autoFillHpEnabled then buyShopItem("FillHP") end
+    if State.autoBuyWeaponsEnabled then for _, item in ipairs(normalizeSelection(State.selectedWeapons)) do buyShopItem(item) end end
+    if State.autoBuyMiscEnabled then buyShopItem(State.selectedMiscItem) end
+    if State.autoBuyRequestEnabled then buyShopItem(State.selectedRequestItem) end
+    if State.autoBuyHourlyEnabled then buyHourlyItemsOnce() end
+end)
+
+loop(0.75, function()
+    if State.autoBuyTitanEnabled then
+        for _, upgrade in ipairs({"Upgrade", "Jetpack", "OverCharge", "SoundBooster", "Core"}) do fireRemote("ChangeUpgradedTitanSpeaker", upgrade) end
+        for _, upgrade in ipairs({"Shield", "Blaster", "Lens", "Heat", "Armor"}) do fireRemote("ForUpgradeUTCM", upgrade) end
+        for _, upgrade in ipairs({"Absorb", "ShareOverCharge", "Shield", "AstroArm"}) do fireRemote("ForUpgradeTV", upgrade) end
+    end
+end)
+
+loop(0.50, function()
+    if State.autoUseRequestEnabled then
+        local character, humanoid = getCharacterParts()
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        if character and humanoid and backpack then
+            local special = backpack:FindFirstChild("SpecialTitan-Request")
+            if special then humanoid:EquipTool(special); fireRemote("SpecialRequest") end
+            local titan = backpack:FindFirstChild("Titan-Request")
+            if titan then humanoid:EquipTool(titan); fireRemote("RequestTitan") end
+        end
+    end
+end)
+
+loop(0.50, function()
+    if State.autoUseItemEnabled then
+        -- [TRACE-GAP] ShopSystem and ChangeToCinema are both consulted, but the exact
+        -- per-item branch was not reachable with dummy item instances.
+        local item = State.selectedUseItem
+        local backpack = LocalPlayer:FindFirstChild("Backpack")
+        local character, humanoid = getCharacterParts()
+        local tool = backpack and backpack:FindFirstChild(item)
+        if tool and humanoid then humanoid:EquipTool(tool) end
+    end
+    if State.autoSkinsEnabled then fireRemote("GachaCapsule") end
+    if State.autoCharactersEnabled then
+        -- [TRACE-GAP] A second gacha loop exists, but its remote name was not observable.
+    end
+end)
+
+loop(0.25, function()
+    if State.fullbrightEnabled then
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+        Lighting.FogEnd = 100000
+        Lighting.GlobalShadows = false
+        Lighting.Ambient = Color3.new(1, 1, 1)
+        Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+    end
+    if State.forceJeffreySitEnabled then
+        local jeffrey = Workspace:FindFirstChild("Jeffrey")
+        local humanoid = jeffrey and jeffrey:FindFirstChild("NotHumanoid")
+        if humanoid then humanoid.Sit = true end
+    end
+end)
+
+-- Original one-shot cleanup observed in the VM.
+task.spawn(function()
+    local ok, prompt = pcall(function()
+        return workspace.SpecterRoom.AnimationLobby["Big Camera man"].Head.ATMChat.ProximityPrompt
+    end)
+    if ok and prompt then prompt:Destroy() end
+end)
+
+refreshConfigList()
+notify("Poly Hub", "Script loaded successfully!", "check", 5)
